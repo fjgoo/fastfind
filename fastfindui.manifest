@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0" processorArchitecture="*"
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*"
                     name="fastfind" type="win32"/>
   <description>fastfind — Everything-style instant file search</description>
   <dependency>
