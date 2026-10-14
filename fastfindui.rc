@@ -1,0 +1,29 @@
+#include "version.h"
+
+1 ICON "fastfind.ico"
+1 24 "fastfindui.manifest"
+
+/* exe Properties > Details; all values come from version.h */
+1 VERSIONINFO
+FILEVERSION    FF_VER_MAJOR, FF_VER_MINOR, FF_VER_PATCH, FF_VER_BUILD
+PRODUCTVERSION FF_VER_MAJOR, FF_VER_MINOR, FF_VER_PATCH, FF_VER_BUILD
+FILEOS         0x40004              /* VOS_NT_WINDOWS32 */
+FILETYPE       0x1                  /* VFT_APP */
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404B0"               /* zh-CN, Unicode */
+    BEGIN
+      VALUE "ProductName",    FF_PRODUCT_NAME
+      VALUE "FileDescription", FF_DESCRIPTION
+      VALUE "FileVersion",    FF_VER_STRING
+      VALUE "ProductVersion", FF_VER_STRING
+      VALUE "InternalName",   "fastfindui"
+      VALUE "OriginalFilename", "fastfindui.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END
