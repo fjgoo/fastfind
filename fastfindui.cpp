@@ -34,6 +34,7 @@
 #include <tlhelp32.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <winioctl.h>
 #include <commdlg.h>
 #include <lmcons.h>
@@ -203,13 +204,15 @@ struct Harvested { uint64_t parent; bool isDir; uint64_t size; int64_t mtime; ve
 static bool harvestRecordNames(uint8_t* rec, uint32_t recLen, Harvested& out) {
     NtfsFileRecordHeader* hdr = (NtfsFileRecordHeader*)rec;
     if (!(hdr->flags & 1)) return false;
-    out.parent = 0; out.isDir = false; out.size = 0; out.mtime = 0; out.names.clear();
+    /* directory flag lives in the record header (bit 1); attribute type
+       0x10 is $STANDARD_INFORMATION, which EVERY record has */
+    out.parent = 0; out.isDir = (hdr->flags & 0x02) != 0;
+    out.size = 0; out.mtime = 0; out.names.clear();
     uint32_t off = hdr->firstAttributeOffset;
     for (int guard = 0; guard < 64; guard++) {
         if (off + 0x18 > recLen) break;
         NtfsAttributeHeader* at = (NtfsAttributeHeader*)(rec + off);
         if (at->type == 0xFFFFFFFF) break;
-        if (at->type == 0x10) out.isDir = true;
         if (at->length < 0x18 || off + at->length > recLen) break;
         if (at->type == 0x30 && !at->nonResident && !at->nameLength) {
             uint16_t valueOff; memcpy(&valueOff, rec + off + 0x14, 2);
@@ -423,9 +426,13 @@ static wstring cacheFile() {
 }
 
 static bool saveCache() {
-    FILE* f = _wfopen(cacheFile().c_str(), L"wb");
+    /* write to a temp file and atomically replace: a crash or kill mid-save
+       must never leave a truncated cache (the previous good one survives) */
+    wstring finalPath = cacheFile();
+    wstring tmpPath = finalPath + L".tmp";
+    FILE* f = _wfopen(tmpPath.c_str(), L"wb");
     if (!f) return false;
-    fwrite("FFIDX004", 1, 8, f);
+    fwrite("FFIDX005", 1, 8, f);
     uint32_t nv = (uint32_t)g_volumes.size();
     fwrite(&nv, 4, 1, f);
     vector<UsnPos> pos;
@@ -455,6 +462,7 @@ static bool saveCache() {
         fwrite(&un, 8, 1, f);
     }
     fclose(f);
+    MoveFileExW(tmpPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING);
     return true;
 }
 
@@ -462,7 +470,7 @@ static bool loadCache(const vector<pair<wchar_t, DWORD>>& live) {
     FILE* f = _wfopen(cacheFile().c_str(), L"rb");
     if (!f) { logf_("CACHE: no file"); return false; }
     char magic[8]; if (fread(magic, 1, 8, f) != 8) { fclose(f); logf_("CACHE: short header"); return false; }
-    if (memcmp(magic, "FFIDX004", 8)) {
+    if (memcmp(magic, "FFIDX005", 8)) {
         magic[7] = 0; logf_("CACHE: magic mismatch (%s)", magic);
         fclose(f); return false; }   // v3 has no USN positions
     uint32_t nv; if (fread(&nv, 4, 1, f) != 1 || nv != live.size()) {
@@ -1502,6 +1510,35 @@ static void copyText(wchar_t* dst, const wchar_t* src, size_t cch) {
     dst[cch - 1] = 0;
 }
 
+/* icon index into the system image list for a result row. Folders share one
+   cached folder icon; files are cached per extension — SHGFI_USEFILEATTRIBUTES
+   resolves purely from the extension, no file access, so the cache fills with
+   one shell call per distinct type and scrolling millions of rows is free. */
+static int iconFor(const Hit* h) {
+    static int folderIcon = -1;
+    static unordered_map<wstring, int> byExt;
+    if (h->isDir) {
+        if (folderIcon < 0) {
+            SHFILEINFOW sfi{};
+            SHGetFileInfoW(L"x", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof sfi,
+                           SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES);
+            folderIcon = sfi.iIcon;
+        }
+        return folderIcon;
+    }
+    size_t dot = h->path.rfind(L'.');
+    size_t slash = h->path.rfind(L'\\');
+    wstring ext = (dot != wstring::npos && dot > slash) ? toLowerW(h->path.substr(dot)) : L"";
+    auto it = byExt.find(ext);
+    if (it != byExt.end()) return it->second;
+    SHFILEINFOW sfi{};
+    wstring fake = ext.empty() ? wstring(L"x") : L"x" + ext;
+    SHGetFileInfoW(fake.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof sfi,
+                   SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES);
+    byExt.emplace(move(ext), sfi.iIcon);
+    return sfi.iIcon;
+}
+
 /* ---- main menu bar / accelerators / status bar -----------------------------
  * Menu layout, labels and shortcuts follow the Everything conventions.
  * Entries for features this build does not implement (ETP/HTTP servers,
@@ -1888,6 +1925,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             10, 44, 760, 440, hwnd, (HMENU)1002, nullptr, nullptr);
         ListView_SetExtendedListViewStyle(g_hList,
             LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        /* system shell icons in the results (folders get the folder icon,
+           files the icon of their type): bind the shared system image list
+           and serve per-item icon indexes on demand */
+        SHFILEINFOW sfiIl{};
+        HIMAGELIST sysIl = (HIMAGELIST)SHGetFileInfoW(L"", 0, &sfiIl, sizeof sfiIl,
+                                                      SHGFI_SMALLICON | SHGFI_SYSICONINDEX);
+        if (sysIl)
+            ListView_SetImageList(g_hList, sysIl, LVSIL_SMALL);
         LVCOLUMNW col;
         int widths[] = { 260, 500, 90, 145 };
         const wchar_t* titles[] = { L"名称", L"路径", L"大小", L"修改时间" };
@@ -2256,9 +2301,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             NMLVDISPINFOW* di = (NMLVDISPINFOW*)nm;
             if (di->item.iItem < 0 || (size_t)di->item.iItem >= g_results.size()) return 0;
             const Hit* h = g_results[di->item.iItem];
+            if (di->item.iSubItem == 0 && (di->item.mask & LVIF_IMAGE))
+                di->item.iImage = iconFor(h);
             wchar_t* dst = di->item.pszText;
             size_t cch = di->item.cchTextMax;
-            if (!dst || cch < 2) return 0;
+            if (!(di->item.mask & LVIF_TEXT) || !dst || cch < 2) return 0;
             size_t p = h->path.rfind(L'\\');
             switch (di->item.iSubItem) {
             case 0:

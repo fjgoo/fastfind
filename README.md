@@ -19,7 +19,7 @@ If this tool is useful to you, please give it a **Star** on GitHub. That is the 
 
 ## Use
 
-Double-click `fastfindui.exe` (reading a volume needs administrator rights). The first index takes about half a minute; later starts load from cache and replay USN changes that happened while the program was closed (a wrapped or recreated journal triggers an automatic full rescan). Type in the box to search; a space means all words must match. Creates, renames, and deletes show up within a few seconds. Double-click a row to reveal that file in Explorer. Closing the window asks between minimizing to the tray and exiting, and remembers the choice (left-click the tray to restore, right-click for its menu).
+Double-click `fastfindui.exe` (reading a volume needs administrator rights). The first index takes about half a minute; later starts load from cache and replay USN changes that happened while the program was closed (a wrapped or recreated journal triggers an automatic full rescan). Type in the box to search; a space means all words must match. Results mix files and folders, and every row shows its shell icon. Creates, renames, and deletes show up within a few seconds. Double-click a row to reveal that file in Explorer. Closing the window asks between minimizing to the tray and exiting, and remembers the choice (left-click the tray to restore, right-click for its menu).
 
 Right-click a folder to search inside it. Register or remove that menu from the tray, or run:
 

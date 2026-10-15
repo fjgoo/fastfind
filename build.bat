@@ -39,4 +39,3 @@ echo Build OK: fastfind.exe + fastfindui.exe
 :end
 rem clean up intermediate object file (regenerated on every build)
 del /q fastfindui_rc.o >nul 2>&1
-pause
