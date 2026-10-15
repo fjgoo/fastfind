@@ -31,6 +31,7 @@
 #define _UNICODE
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <winioctl.h>
@@ -984,6 +985,7 @@ enum { IDT_DRAIN = 1, IDT_IDLE = 2, IDT_SEARCH = 3, IDT_SELSTAT = 4,
        IDM_HELP_HELP = 21090, IDM_HELP_SYNTAX = 21091, IDM_HELP_CMDLINE = 21092,
        IDM_HELP_ABOUT = 21093 };
 #define WM_TRAYICON (WM_APP + 4)
+#define WM_SHOWEXISTING (WM_APP + 5)   /* second launch: show the running window */
 
 /* ---- Everything-style UI state ------------------------------------------- */
 enum SortField { SORT_NAME = 0, SORT_PATH, SORT_SIZE, SORT_EXT, SORT_DATE };
@@ -2152,6 +2154,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             trayMenu();
         }
         return 0;
+    case WM_SHOWEXISTING:
+        showMainWindow();
+        return 0;
     case WM_CONTEXTMENU:
         /* right-click on a search result: Everything-style menu with
            open / open-path (jump to folder) / copy path / properties */
@@ -2296,6 +2301,153 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* Ask a live instance to show itself. Returns false when the window is gone
+   or its UI thread is blocked (exit saves the index inside WM_DESTROY, so the
+   HWND can still exist while nothing is on screen). A false result must not
+   be silent — the caller shows a window explaining the lock. */
+static bool revealExisting(HWND h) {
+    if (!h || !IsWindow(h)) return false;
+    if (!IsWindowVisible(h) || IsIconic(h)) {
+        DWORD_PTR result = 0;
+        if (!SendMessageTimeoutW(h, WM_SHOWEXISTING, 0, 0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &result))
+            return false;
+    }
+    DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    DWORD tg = GetWindowThreadProcessId(h, nullptr);
+    if (fg && fg != tg) AttachThreadInput(fg, tg, TRUE);
+    if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+    ShowWindow(h, SW_SHOW);
+    if (!SetForegroundWindow(h)) FlashWindow(h, TRUE);
+    BringWindowToTop(h);
+    if (fg && fg != tg) AttachThreadInput(fg, tg, FALSE);
+    return IsWindowVisible(h) != FALSE;
+}
+
+static HANDLE g_busyMutex = nullptr;
+static bool g_busyGot = false;
+
+static wstring otherFastfindPids() {
+    wstring s;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return s;
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof pe;
+    DWORD self = GetCurrentProcessId();
+    int n = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == self) continue;
+            if (_wcsicmp(pe.szExeFile, L"fastfindui.exe")) continue;
+            wchar_t line[80];
+            _snwprintf(line, 80, L"fastfindui.exe（PID %lu）\n", pe.th32ProcessID);
+            s += line;
+            if (++n >= 8) break;
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return s;
+}
+
+static LRESULT CALLBACK BusyProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        NONCLIENTMETRICSW ncm{ sizeof ncm };
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+        HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)font);
+        const wchar_t* text = (const wchar_t*)((CREATESTRUCTW*)lp)->lpCreateParams;
+        HWND st = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                  18, 16, 484, 168, hwnd, nullptr, nullptr, nullptr);
+        HWND btn = CreateWindowExW(0, L"BUTTON", L"取消",
+                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                                   210, 192, 100, 30, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
+        SendMessageW(st, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(btn, WM_SETFONT, (WPARAM)font, TRUE);
+        SetTimer(hwnd, 1, 200, nullptr);
+        return 0;
+    }
+    case WM_TIMER: {
+        DWORD wr = WaitForSingleObject(g_busyMutex, 0);
+        if (wr == WAIT_OBJECT_0 || wr == WAIT_ABANDONED) {
+            g_busyGot = true;
+            KillTimer(hwnd, 1);
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY: {
+        HFONT font = (HFONT)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (font) DeleteObject(font);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Lock is held and no usable window is on screen. Show that immediately —
+   a silent wait looks like the double-click did nothing. When the owner
+   releases the mutex (index save finished, or the process exited), close
+   this notice and let startup continue. */
+static bool waitWhileBusy(HINSTANCE hInst, HANDLE single) {
+    g_busyMutex = single;
+    g_busyGot = false;
+    wstring pids = otherFastfindPids();
+    wstring text =
+        L"fastfind 的启动锁仍被占用，所以这次没有直接打开新窗口。\n\n"
+        L"窗口和托盘这时可能已经关闭，进程还在把索引写回磁盘。"
+        L"写完后这个提示会关掉，并自动打开 fastfind。\n\n";
+    if (!pids.empty()) {
+        text += L"仍在运行：\n";
+        text += pids;
+        text += L"\n如果一直停在这里，请到任务管理器结束上面的进程，或点“取消”。";
+    } else {
+        text += L"没有找到 fastfindui.exe。锁可能马上会释放；"
+                L"若不想等，点“取消”后再试。";
+    }
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = BusyProc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = L"fastfindui-busy";
+    wc.hIcon = LoadIcon(nullptr, IDI_INFORMATION);
+    RegisterClassW(&wc);
+
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    DWORD ex = WS_EX_TOPMOST | WS_EX_DLGMODALFRAME;
+    RECT rc{ 0, 0, 520, 240 };
+    AdjustWindowRectEx(&rc, style, FALSE, ex);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+    HWND hwnd = CreateWindowExW(ex, wc.lpszClassName, L"fastfind", style,
+                                x, y, w, h, nullptr, nullptr, hInst,
+                                (LPVOID)text.c_str());
+    if (!hwnd) {
+        MessageBoxW(nullptr, text.c_str(), L"fastfind", MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    MSG msg;
+    while (IsWindow(hwnd) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return g_busyGot;
+}
+
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     /* command line:
        -install-menu / -uninstall-menu   register/remove the Explorer context
@@ -2321,12 +2473,29 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
         }
         if (argvW) LocalFree(argvW);
     }
-    // single instance: a tray-resident copy would otherwise double the memory
-    HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\fastfindui-single-instance");
-    if (!single || GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(nullptr, L"fastfind 已经在运行（可能已最小化到系统托盘）。",
-                    L"fastfind", MB_OK | MB_ICONINFORMATION);
+    /* single instance. Ownership, not the name, means "running": exit drops
+       the window and tray first, then keeps the mutex while it writes the
+       index. If that owner still has a window that can be shown, show it.
+       Otherwise put a notice on screen immediately — waiting in silence looks
+       like the double-click was ignored. The notice closes itself and startup
+       continues once the owner releases the mutex. */
+    HANDLE single = CreateMutexW(nullptr, FALSE, L"Local\\fastfindui-single-instance");
+    if (!single) {
+        MessageBoxW(nullptr, L"无法启动 fastfind（创建实例锁失败）。",
+                    L"fastfind", MB_OK | MB_ICONERROR);
         return 0;
+    }
+    DWORD wr = WaitForSingleObject(single, 0);
+    if (wr != WAIT_OBJECT_0 && wr != WAIT_ABANDONED) {
+        HWND other = FindWindowW(L"fastfindui", nullptr);
+        if (other && revealExisting(other)) {
+            CloseHandle(single);
+            return 0;
+        }
+        if (!waitWhileBusy(hInst, single)) {
+            CloseHandle(single);
+            return 0;
+        }
     }
     if (const char* lg = getenv("FASTFINDUI_LOG")) {
         wchar_t w[MAX_PATH]; MultiByteToWideChar(CP_UTF8, 0, lg, -1, w, MAX_PATH);
@@ -2375,6 +2544,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
         DispatchMessageW(&msg);
     }
     if (g_log) fclose(g_log);
-    if (single) ReleaseMutex(single);
+    ReleaseMutex(single);
+    CloseHandle(single);
     return (int)msg.wParam;
 }
