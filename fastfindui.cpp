@@ -1179,12 +1179,12 @@ static Query parseQuery(const wstring& text) {
         else if (low == L"file:")   { if (!neg) q.filesOnly = true;   continue; }
         else if (low == L"folder:") { if (!neg) q.foldersOnly = true; continue; }
         else if (low.rfind(L"ext:", 0) == 0 && low.size() > 4) {
-            low.insert(0, 1, L'.');
-            size_t s = 0;                          // ext:mp3;wav;flac — multi value
+            low.erase(0, 4);                        // ext:mp3;wav;flac — multi value
+            size_t s = 0;
             while (s < low.size()) {
                 size_t e = low.find(L';', s);
                 wstring one = low.substr(s, e == wstring::npos ? wstring::npos : e - s);
-                if (!one.empty()) (neg ? q.extsNeg : q.exts).push_back(one);
+                if (!one.empty()) (neg ? q.extsNeg : q.exts).push_back(L"." + one);
                 if (e == wstring::npos) break;
                 s = e + 1;
             }

@@ -1,14 +1,14 @@
 /* fastfind version — single source of truth.
-   Edit the four numbers below; the display string ("1.0.0.1"), the About
+   Edit the four numbers below; the display string ("1.0.0.2"), the About
    dialog and the exe version resource are all derived from them. */
 #pragma once
 
 #define FF_VER_MAJOR 1
 #define FF_VER_MINOR 0
 #define FF_VER_PATCH 0
-#define FF_VER_BUILD 1
+#define FF_VER_BUILD 2
 
-/* "1.0.0.1" built from the numbers so nothing can drift apart */
+/* "1.0.0.2" built from the numbers so nothing can drift apart */
 #define FF_STR_(x) #x
 #define FF_STR(x)  FF_STR_(x)
 #define FF_VER_STRING FF_STR(FF_VER_MAJOR) "." FF_STR(FF_VER_MINOR) "." \
